@@ -188,6 +188,13 @@ function inferLimit(body: string) {
   return undefined;
 }
 
+function hasExplicitLimit(body: string) {
+  return (
+    /(?:上限|制限)[：:\s]*(\d+)\s*文字/.test(body) ||
+    /(\d+)\s*文字\s*(?:以内|以下|まで)/.test(body)
+  );
+}
+
 function inferQuestion(body: string) {
   return body.match(/設問[：:]\s*(.+)/)?.[1]?.trim();
 }
@@ -250,6 +257,48 @@ function stripAnswerPlaceholder(body: string) {
     .trim();
 }
 
+function isHorizontalRule(line: string) {
+  return /^[ \t]*-{3,}[ \t]*$/.test(line);
+}
+
+function splitLooseTextBody(body: string) {
+  const lines = body.replace(/\r\n/g, "\n").split("\n");
+  const quoteValues: string[] = [];
+  let hasQuotePlaceholder = false;
+  let hasAnswerPlaceholder = false;
+
+  const instructionLines = lines.filter((line) => {
+    if (/^[ \t]*[（(]回答欄[）)][ \t]*$/.test(line)) {
+      hasAnswerPlaceholder = true;
+      return false;
+    }
+
+    const quote = line.match(/^[ \t]*>[ \t]?(.*)$/);
+    if (quote) {
+      hasQuotePlaceholder = true;
+      quoteValues.push(quote[1] ?? "");
+      return false;
+    }
+
+    return !isHorizontalRule(line);
+  });
+
+  const instruction = instructionLines.join("\n").trim();
+  const quotedAnswer = quoteValues.join("\n").trim();
+
+  if (hasQuotePlaceholder || hasAnswerPlaceholder) {
+    return { instruction, answer: quotedAnswer };
+  }
+
+  const existingAnswer = stripAnswerPlaceholder(body);
+  const answer =
+    existingAnswer && instruction && existingAnswer.endsWith(instruction)
+      ? ""
+      : existingAnswer.replace(instruction, "").trim();
+
+  return { instruction, answer };
+}
+
 function addTextField(heading: string, body: string, sectionIndex: number) {
   if (hasTextField(body)) return body;
   const limit = inferLimit(body);
@@ -257,7 +306,8 @@ function addTextField(heading: string, body: string, sectionIndex: number) {
 
   const id = `${fieldIdFromHeading(heading, `section_${sectionIndex + 1}`)}_text`;
   const label = escapeLabel(heading.replace(/^\d+\.\s*/, ""));
-  const targetMin = limit >= 300 ? limit - 10 : undefined;
+  const explicitLimit = hasExplicitLimit(body);
+  const targetMin = explicitLimit && limit >= 300 ? limit - 10 : undefined;
   const metaAttrs = [
     `id=${id}`,
     "type=textarea",
@@ -268,21 +318,10 @@ function addTextField(heading: string, body: string, sectionIndex: number) {
   ]
     .filter(Boolean)
     .join(" ");
-  const existingAnswer = stripAnswerPlaceholder(body);
-  const question = inferQuestion(body);
-  const instructionLines = body
-    .split("\n")
-    .filter((line) => !/^[ \t]*[（(]回答欄[）)][ \t]*$/.test(line))
-    .filter((line) => !/^[ \t]*>[ \t]*$/.test(line))
-    .join("\n")
-    .trim();
-  const answer =
-    existingAnswer && question && existingAnswer.endsWith(question)
-      ? ""
-      : existingAnswer.replace(instructionLines, "").trim();
+  const { instruction, answer } = splitLooseTextBody(body);
 
   return [
-    instructionLines,
+    instruction,
     "",
     `<!-- es:meta ${metaAttrs} -->`,
     `<!-- es:start id=${id} limit=${limit} label="${label}" -->`,
@@ -302,7 +341,31 @@ function splitSubsections(body: string) {
     headings.push({ heading: match[1].trim(), start: match.index, end: headingRe.lastIndex });
   }
 
-  if (headings.length === 0) return null;
+  if (headings.length === 0) {
+    return splitBoldPromptBlocks(body);
+  }
+
+  return {
+    prelude: body.slice(0, headings[0].start).trim(),
+    subsections: headings.map((heading, index) => ({
+      heading: heading.heading,
+      body: body.slice(heading.end, headings[index + 1]?.start ?? body.length).trim(),
+    })),
+  };
+}
+
+function splitBoldPromptBlocks(body: string) {
+  const headingRe = /^\s*\*\*(.+?)\*\*\s*(.*?)\s*$/gm;
+  const headings: { heading: string; start: number; end: number }[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = headingRe.exec(body)) !== null) {
+    const heading = `${match[1]} ${match[2]}`.replace(/\s+/g, " ").trim();
+    if (!heading || /^選択肢$/.test(heading)) continue;
+    headings.push({ heading, start: match.index, end: headingRe.lastIndex });
+  }
+
+  if (headings.length < 2) return null;
 
   return {
     prelude: body.slice(0, headings[0].start).trim(),
@@ -315,14 +378,21 @@ function splitSubsections(body: string) {
 
 function addTextFieldsForSubsections(sectionHeading: string, body: string, sectionIndex: number) {
   const split = splitSubsections(body);
-  if (!split) return addTextField(sectionHeading, body, sectionIndex);
+  if (!split) {
+    let sectionBody = wrapChoices(sectionHeading, body, sectionIndex);
+    sectionBody = wrapTable(sectionHeading, sectionBody, sectionIndex);
+    return addTextField(sectionHeading, sectionBody, sectionIndex);
+  }
 
   const parts = split.prelude ? [split.prelude, ""] : [];
   split.subsections.forEach((subsection, subIndex) => {
     const combinedHeading = `${sectionHeading} ${subsection.heading}`;
+    const subsectionIndex = Number(`${sectionIndex + 1}${subIndex + 1}`);
+    let subsectionBody = wrapChoices(combinedHeading, subsection.body, subsectionIndex);
+    subsectionBody = wrapTable(combinedHeading, subsectionBody, subsectionIndex);
     parts.push(`### ${subsection.heading}`);
     parts.push("");
-    parts.push(addTextField(combinedHeading, subsection.body, Number(`${sectionIndex + 1}${subIndex + 1}`)));
+    parts.push(addTextField(combinedHeading, subsectionBody, subsectionIndex));
     parts.push("");
   });
 
@@ -342,8 +412,6 @@ export function standardizeMarkdown(markdown: string) {
       section.heading = `${section.heading} ${index + 1}`;
     }
     used.add(baseId);
-    body = wrapChoices(section.heading, body, index);
-    body = wrapTable(section.heading, body, index);
     body = addTextFieldsForSubsections(section.heading, body, index);
     output.push(`## ${section.heading}`, "", body.trim(), "");
   });
@@ -359,16 +427,24 @@ function sectionForIndex(sections: EsSection[], index: number) {
 }
 
 function extractQuestion(markdown: string, section: EsSection, fieldStart: number, label: string) {
-  const source = markdown.slice(section.bodyStart, fieldStart);
+  let source = markdown.slice(section.bodyStart, fieldStart);
+  const subheadingMatches = [...source.matchAll(/^###\s+.+$/gm)];
+  const nearestSubheading = subheadingMatches.at(-1);
+  if (nearestSubheading?.index !== undefined) {
+    source = source.slice(nearestSubheading.index);
+  }
+
   const lines = source
+    .replace(/<!--[\s\S]*?-->/g, "")
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
-    .filter((line) => !line.includes("<!-- es:count"))
     .filter((line) => !line.startsWith("**文字数："))
+    .map((line) => line.replace(/^###\s+/, ""))
     .filter((line) => !/^上限[:：]/.test(line))
     .filter((line) => !/^記入例[:：]/.test(line))
     .filter((line) => !/^例[:：]/.test(line))
+    .filter((line) => !/^>[ \t]*$/.test(line))
     .filter((line) => !/^---+$/.test(line));
   const explicit = lines.find((line) => /^設問[:：]/.test(line));
   if (explicit) return explicit.replace(/^設問[:：]\s*/, "");
